@@ -1,6 +1,9 @@
 {
   "name": "@wyre-technology/connectwise-manage-mcp",
   "version": "1.4.0",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
   "description": "ConnectWise Manage (PSA) MCP server for Claude",
   "type": "module",
   "main": "dist/index.js",
