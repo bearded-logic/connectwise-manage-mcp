@@ -38,11 +38,9 @@ import {
   Server as HttpServer,
 } from "node:http";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { getConfig, CwManageClient } from "./api-client.js";
 import { getEntraConfig, createJwksClient, validateToken } from "./auth/middleware.js";
 import {
   handleProtectedResource,
@@ -52,85 +50,11 @@ import {
   handleToken,
 } from "./auth/routes.js";
 import { AuthError } from "./auth/types.js";
-import { registerTicketTools } from "./tools/tickets.js";
-import { registerCompanyTools } from "./tools/companies.js";
-import { registerContactTools } from "./tools/contacts.js";
-import { registerProjectTools } from "./tools/projects.js";
-import { registerTimeEntryTools } from "./tools/time-entries.js";
-import { registerMemberTools } from "./tools/members.js";
-import { registerConfigurationTools } from "./tools/configurations.js";
-import { registerServiceTools } from "./tools/service.js";
-import { registerActivityTools } from "./tools/activities.js";
-import { registerCatalogTools } from "./tools/catalog.js";
-import { registerHealthTools } from "./tools/health.js";
-import { registerAgreementTools } from "./tools/agreements.js";
-import { registerOpportunityTools } from "./tools/opportunities.js";
-
-// ---------------------------------------------------------------------------
-// Server factory
-// ---------------------------------------------------------------------------
-
-function createMcpServer(): McpServer {
-  const server = new McpServer({
-    name: "connectwise-manage-mcp",
-    version: "1.1.5",
-  });
-
-  const config = getConfig();
-
-  if (!config) {
-    // Register a single diagnostic tool so the client gets a clear error
-    server.tool(
-      "cw_test_connection",
-      "Test the connection to ConnectWise Manage.",
-      {},
-      async () => ({
-        content: [
-          {
-            type: "text",
-            text: [
-              "Error: Missing ConnectWise Manage credentials.",
-              "",
-              "Required environment variables:",
-              "  CW_MANAGE_COMPANY_ID        - Your ConnectWise company identifier",
-              "  CW_MANAGE_PUBLIC_KEY        - API member public key",
-              "  CW_MANAGE_PRIVATE_KEY       - API member private key",
-              "  CW_MANAGE_CLIENT_ID         - Client ID from ConnectWise Developer Portal",
-              "",
-              "Optional:",
-              "  CW_MANAGE_URL               - API base URL",
-              "    Cloud:       https://api-na.myconnectwise.net (default)",
-              "                 https://api-eu.myconnectwise.net",
-              "                 https://api-au.myconnectwise.net",
-              "    Self-hosted: https://cwm.yourcompany.com",
-              "  CW_MANAGE_REJECT_UNAUTHORIZED - Set to 'false' for self-signed certs",
-            ].join("\n"),
-          },
-        ],
-        isError: true,
-      }),
-    );
-    return server;
-  }
-
-  const client = new CwManageClient(config);
-
-  registerTicketTools(server, client);
-  registerCompanyTools(server, client);
-  registerContactTools(server, client);
-  registerProjectTools(server, client);
-  registerTimeEntryTools(server, client);
-  registerMemberTools(server, client);
-  registerConfigurationTools(server, client);
-  registerServiceTools(server, client);
-  registerActivityTools(server, client);
-  registerCatalogTools(server, client);
-  registerHealthTools(server, client);
-  registerAgreementTools(server, client);
-  registerOpportunityTools(server, client);
-
-  return server;
-}
+import {
+  createMcpServer,
+  resolveGatewayConfig,
+  type CwManageConfig,
+} from "./mcp-server.js";
 
 // ---------------------------------------------------------------------------
 // Transport: stdio
@@ -315,20 +239,15 @@ async function startHttpTransport(): Promise<void> {
         }
 
         // ------------------------------------------------------------------
-        // Gateway mode: extract CW credentials from headers
+        // Gateway mode: extract CW credentials from headers (per request,
+        // no global process.env mutation so concurrent requests stay isolated)
         // ------------------------------------------------------------------
+        let configOverride: CwManageConfig | undefined;
         if (isGatewayMode) {
-          const headers = req.headers as Record<
-            string,
-            string | string[] | undefined
-          >;
-          const companyId = headers["x-cw-company-id"] as string | undefined;
-          const publicKey = headers["x-cw-public-key"] as string | undefined;
-          const privateKey = headers["x-cw-private-key"] as string | undefined;
-          const clientId = headers["x-cw-client-id"] as string | undefined;
-          const baseUrl = headers["x-cw-url"] as string | undefined;
-
-          if (!companyId || !publicKey || !privateKey || !clientId) {
+          const { config, error } = resolveGatewayConfig(
+            (name) => req.headers[name] as string | undefined,
+          );
+          if (error) {
             res.writeHead(401, { "Content-Type": "application/json" });
             res.end(
               JSON.stringify({
@@ -345,20 +264,13 @@ async function startHttpTransport(): Promise<void> {
             );
             return;
           }
-
-          process.env.CW_MANAGE_COMPANY_ID = companyId;
-          process.env.CW_MANAGE_PUBLIC_KEY = publicKey;
-          process.env.CW_MANAGE_PRIVATE_KEY = privateKey;
-          process.env.CW_MANAGE_CLIENT_ID = clientId;
-          if (baseUrl) {
-            process.env.CW_MANAGE_URL = baseUrl;
-          }
+          configOverride = config;
         }
 
         // ------------------------------------------------------------------
         // MCP handler
         // ------------------------------------------------------------------
-        const server = createMcpServer();
+        const server = createMcpServer(configOverride);
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
           enableJsonResponse: true,
