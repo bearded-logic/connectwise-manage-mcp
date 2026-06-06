@@ -88,4 +88,40 @@ export function registerCompanyTools(server: McpServer, client: CwManageClient) 
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
+
+  // ── TechConnect additions ──────────────────────────────────────────────────
+
+  server.tool(
+    "cw_list_company_notes",
+    "List notes on a company in ConnectWise Manage. Useful for account flags, VIP status, contract notes, or known issues.",
+    {
+      id: z.number().describe("Company ID"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ id, page, pageSize }) => {
+      const result = await client.get(`/company/companies/${id}/notes`, {
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "cw_list_company_sites",
+    "List sites (physical locations) for a company in ConnectWise Manage.",
+    {
+      id: z.number().describe("Company ID"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ id, page, pageSize }) => {
+      const result = await client.get(`/company/companies/${id}/sites`, {
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
 }

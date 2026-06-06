@@ -184,6 +184,25 @@ async function startHttpTransport(): Promise<void> {
       // Entra ID auth check
       // ------------------------------------------------------------------
       const handleMcp = async () => {
+        // Simple API key auth — active when MCP_OAUTH_ENABLED=false and MCP_API_KEY is set.
+        // Copilot Studio: Tools → Add tool → MCP → Auth: API key → Header name: X-API-Key
+        // For production TechConnect, upgrade to full Entra ID OAuth (MCP_OAUTH_ENABLED=true).
+        if (!oauthEnabled && process.env.MCP_API_KEY) {
+          const provided = req.headers["x-api-key"] as string | undefined;
+          const expected = process.env.MCP_API_KEY;
+          const valid =
+            provided !== undefined &&
+            timingSafeEqual(
+              createHash("sha256").update(provided).digest(),
+              createHash("sha256").update(expected).digest(),
+            );
+          if (!valid) {
+            res.writeHead(401, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "unauthorized", message: "Valid X-API-Key header required" }));
+            return;
+          }
+        }
+
         if (oauthEnabled && entraConfig) {
           const authHeader = req.headers.authorization;
 

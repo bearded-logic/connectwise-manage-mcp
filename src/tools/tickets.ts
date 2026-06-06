@@ -147,4 +147,75 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
       return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
     },
   );
+
+  // ── TechConnect additions ──────────────────────────────────────────────────
+
+  server.tool(
+    "cw_list_ticket_tasks",
+    "List tasks (checklist items) on a specific service ticket. Shows what has been done and what is still pending.",
+    {
+      id: z.number().describe("Ticket ID"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ id, page, pageSize }) => {
+      const result = await client.get(`/service/tickets/${id}/tasks`, {
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "cw_list_ticket_products",
+    "List products (hardware/software) associated with a specific service ticket.",
+    {
+      id: z.number().describe("Ticket ID"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ id, page, pageSize }) => {
+      const result = await client.get(`/service/tickets/${id}/products`, {
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "cw_list_ticket_documents",
+    "List document attachment metadata on a specific service ticket (names and types — not file contents).",
+    {
+      id: z.number().describe("Ticket ID"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ id, page, pageSize }) => {
+      const result = await client.get(`/service/tickets/${id}/documents`, {
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  server.tool(
+    "cw_list_ticket_links",
+    "List explicitly linked (related) tickets for a given ticket. Useful for spotting recurring issues or related incidents.",
+    {
+      conditions: z.string().optional().describe("ConnectWise conditions query string (e.g. filter by ticketId)"),
+      page: z.number().optional().describe("Page number (default: 1)"),
+      pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
+    },
+    async ({ conditions, page, pageSize }) => {
+      const result = await client.get("/service/ticketLinks", {
+        conditions,
+        page: page ?? 1,
+        pageSize: pageSize ?? 25,
+      });
+      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+    },
+  );
 }
