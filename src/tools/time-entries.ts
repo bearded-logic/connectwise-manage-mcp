@@ -7,7 +7,7 @@ export function registerTimeEntryTools(server: McpServer, client: CwManageClient
     "cw_search_time_entries",
     "Search time entries in ConnectWise Manage.",
     {
-      conditions: z.string().optional().describe("ConnectWise conditions query string (e.g. \"member/identifier = 'jsmith'\")"),
+      conditions: z.string().optional().describe("ConnectWise conditions query string. IMPORTANT: date fields must use ISO 8601 — e.g. \"timeStart >= [2026-06-07T00:00:00Z]\". Never use DD/MM/YYYY (ConnectWise treats it as MM/DD). Other examples: \"member/identifier = 'jsmith'\", \"chargeToId = 57696\"."),
       page: z.number().optional().describe("Page number (default: 1)"),
       pageSize: z.number().optional().describe("Results per page (default: 25, max: 1000)"),
       orderBy: z.string().optional().describe("Field to order by"),

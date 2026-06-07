@@ -5,12 +5,12 @@ import { CwManageClient } from "../api-client.js";
 export function registerTicketTools(server: McpServer, client: CwManageClient) {
   server.tool(
     "cw_search_tickets",
-    "Search service tickets in ConnectWise Manage. Use 'conditions' for CW query syntax (e.g. \"status/name != 'Closed'\" or \"company/name = 'Acme'\").",
+    "Search service tickets in ConnectWise Manage. Use 'conditions' for CW query syntax (e.g. \"status/name != 'Closed'\", \"company/name = 'Acme'\", or date range \"dateEntered >= [2026-06-07T00:00:00Z] AND dateEntered < [2026-06-08T00:00:00Z]\").",
     {
       conditions: z
         .string()
         .optional()
-        .describe("ConnectWise conditions query string"),
+        .describe("ConnectWise conditions query string. IMPORTANT: date fields must use ISO 8601 format — e.g. \"dateEntered >= [2026-06-07T00:00:00Z]\". Never use DD/MM/YYYY (ConnectWise treats it as MM/DD and returns wrong results)."),
       page: z.number().optional().describe("Page number (default: 1)"),
       pageSize: z
         .number()
