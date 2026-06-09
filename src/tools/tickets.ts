@@ -2,10 +2,44 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CwManageClient } from "../api-client.js";
 
+/**
+ * Concise default field set for ticket *searches*. ConnectWise otherwise returns
+ * the full (very large) ticket object per record, which can overflow an LLM's
+ * context when several tickets come back (OpenAIModelTokenLimit). Callers can
+ * override with the `fields` param; child fields use '/'. For the complete
+ * object, use cw_get_ticket on a single id.
+ */
+const DEFAULT_TICKET_FIELDS = [
+  "id",
+  "summary",
+  "board/name",
+  "status/name",
+  "priority/name",
+  "priority/sort",
+  "company/name",
+  "company/identifier",
+  "contact/name",
+  "owner/identifier",
+  "owner/name",
+  "resources",
+  "type/name",
+  "severity",
+  "impact",
+  "dateEntered",
+  "requiredDate",
+  "closedFlag",
+  "isInSla",
+  "respondMinutes",
+  "resolveMinutes",
+  "resPlanMinutes",
+  "resplanGoalUTC",
+  "agreement/name",
+].join(",");
+
 export function registerTicketTools(server: McpServer, client: CwManageClient) {
   server.tool(
     "cw_search_tickets",
-    "Search service tickets in ConnectWise Manage. Use 'conditions' for CW query syntax (e.g. \"status/name != 'Closed'\", \"company/name = 'Acme'\", or date range \"dateEntered >= [2026-06-07T00:00:00Z] AND dateEntered < [2026-06-08T00:00:00Z]\").",
+    "Search service tickets in ConnectWise Manage. Use 'conditions' for CW query syntax (e.g. \"closedFlag = false and owner/id = 156\", \"company/name = 'Acme'\", or date range \"dateEntered >= [2026-06-07T00:00:00Z] AND dateEntered < [2026-06-08T00:00:00Z]\"). Returns a concise default field set to keep responses small; pass 'fields' (comma-separated CW paths) to override, or use cw_get_ticket for the full object.",
     {
       conditions: z
         .string()
@@ -19,16 +53,23 @@ export function registerTicketTools(server: McpServer, client: CwManageClient) {
       orderBy: z
         .string()
         .optional()
-        .describe("Field to order by (e.g. 'id desc')"),
+        .describe("Field to order by (e.g. 'priority/sort asc', 'id desc')"),
+      fields: z
+        .string()
+        .optional()
+        .describe(
+          "Comma-separated CW field paths to return (child fields use '/', e.g. 'id,summary,status/name,company/name'). Defaults to a concise triage/planning set; pass your own to widen or narrow.",
+        ),
     },
-    async ({ conditions, page, pageSize, orderBy }) => {
+    async ({ conditions, page, pageSize, orderBy, fields }) => {
       const result = await client.get("/service/tickets", {
         conditions,
         page: page ?? 1,
         pageSize: pageSize ?? 25,
         orderBy,
+        fields: fields ?? DEFAULT_TICKET_FIELDS,
       });
-      return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(result) }] };
     },
   );
 
