@@ -41,7 +41,13 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { getEntraConfig, createJwksClient, validateToken } from "./auth/middleware.js";
+import {
+  getEntraConfig,
+  createJwksClient,
+  validateToken,
+  getCoworkEntraConfig,
+  validateCoworkToken,
+} from "./auth/middleware.js";
 import {
   handleProtectedResource,
   handleAuthServerMetadata,
@@ -49,7 +55,7 @@ import {
   handleAuthorize,
   handleToken,
 } from "./auth/routes.js";
-import { AuthError } from "./auth/types.js";
+import { AuthError, type McpAuthMode } from "./auth/types.js";
 import {
   createMcpServer,
   resolveGatewayConfig,
@@ -76,25 +82,75 @@ let httpServer: HttpServer | undefined;
 async function startHttpTransport(): Promise<void> {
   const port = parseInt(process.env.MCP_HTTP_PORT || "8080", 10);
   const host = process.env.MCP_HTTP_HOST || "0.0.0.0";
-  const authMode = process.env.AUTH_MODE || "env";
-  const isGatewayMode = authMode === "gateway";
+
+  // CW credential mode: where CW API keys come from.
+  // New name: CW_CREDENTIAL_MODE. Legacy fallback: AUTH_MODE=env|gateway.
+  const cwCredRaw = process.env.CW_CREDENTIAL_MODE
+    ?? (["env", "gateway"].includes(process.env.AUTH_MODE ?? "") ? process.env.AUTH_MODE : undefined)
+    ?? "env";
+  const isGatewayMode = cwCredRaw === "gateway";
+
+  // MCP auth mode: how /mcp is protected.
+  // Valid values: entra | apikey | none. Default: apikey.
+  // If AUTH_MODE is still set to a legacy CW value (env/gateway), fall back to apikey.
+  const rawMcpAuth = process.env.AUTH_MODE ?? "apikey";
+  const mcpAuthMode: McpAuthMode = (["entra", "apikey", "none"] as const).includes(rawMcpAuth as McpAuthMode)
+    ? (rawMcpAuth as McpAuthMode)
+    : "apikey";
 
   // ---------------------------------------------------------------------------
-  // Entra ID auth setup (optional)
+  // Fail-closed: AUTH_MODE=entra requires tenant + audience at startup
+  // ---------------------------------------------------------------------------
+  if (mcpAuthMode === "entra") {
+    const tid = process.env.ENTRA_TENANT_ID ?? process.env.AZURE_TENANT_ID;
+    const aud = process.env.ENTRA_AUDIENCE ?? process.env.AZURE_AUDIENCE;
+    if (!tid || !aud) {
+      console.error(
+        "[auth] FATAL: AUTH_MODE=entra requires ENTRA_TENANT_ID and ENTRA_AUDIENCE (or AZURE_* equivalents). Refusing to start.",
+      );
+      process.exit(1);
+    }
+  }
+
+  if (mcpAuthMode === "none") {
+    console.error(
+      "[auth] WARNING: AUTH_MODE=none — /mcp endpoint is UNPROTECTED. Use only in isolated dev environments.",
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Legacy Claude.ai / Claude Code OAuth proxy (MCP_OAUTH_ENABLED=true)
+  // Independent of AUTH_MODE — supports the full PKCE proxy flow.
   // ---------------------------------------------------------------------------
   const oauthEnabled = process.env.MCP_OAUTH_ENABLED === "true";
   let entraConfig: ReturnType<typeof getEntraConfig> | null = null;
-  let jwksClient: ReturnType<typeof createJwksClient> | null = null;
+  let oauthJwks: ReturnType<typeof createJwksClient> | null = null;
 
   if (oauthEnabled) {
     entraConfig = getEntraConfig();
-    jwksClient = createJwksClient(entraConfig);
+    oauthJwks = createJwksClient(entraConfig.tenantId);
     console.error(
       `[auth] Entra ID OAuth enabled — tenant: ${entraConfig.tenantId}, required role: ${entraConfig.requiredRole}`,
     );
     if (entraConfig.bearerToken) {
       console.error("[auth] Static bearer token fallback enabled (CLI/Desktop)");
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Cowork / vault-injection Entra setup (AUTH_MODE=entra)
+  // ---------------------------------------------------------------------------
+  let coworkEntraConfig: ReturnType<typeof getCoworkEntraConfig> | null = null;
+  let coworkJwks: ReturnType<typeof createJwksClient> | null = null;
+
+  if (mcpAuthMode === "entra") {
+    coworkEntraConfig = getCoworkEntraConfig();
+    coworkJwks = createJwksClient(coworkEntraConfig.tenantId);
+    console.error(
+      `[auth] AUTH_MODE=entra — Entra SSO active. tenant: ${coworkEntraConfig.tenantId}, audiences: [${coworkEntraConfig.audiences.join(", ")}], allowed clients: [${coworkEntraConfig.allowedClientIds.join(", ")}]`,
+    );
+  } else if (mcpAuthMode === "apikey") {
+    console.error(`[auth] AUTH_MODE=apikey — static API key auth active`);
   }
 
   httpServer = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -158,7 +214,8 @@ async function startHttpTransport(): Promise<void> {
         JSON.stringify({
           status: "ok",
           transport: "http",
-          authMode: isGatewayMode ? "gateway" : "env",
+          mcpAuthMode,
+          credentialMode: isGatewayMode ? "gateway" : "env",
           oauthEnabled,
           timestamp: new Date().toISOString(),
         }),
@@ -181,14 +238,84 @@ async function startHttpTransport(): Promise<void> {
       }
 
       // ------------------------------------------------------------------
-      // Entra ID auth check
+      // Auth dispatch
       // ------------------------------------------------------------------
       const handleMcp = async () => {
-        // Simple API key auth — active when MCP_OAUTH_ENABLED=false and MCP_API_KEY is set.
-        // Copilot Studio: Tools → Add tool → MCP → Auth: API key → Header name: X-API-Key
-        // For production TechConnect, upgrade to full Entra ID OAuth (MCP_OAUTH_ENABLED=true).
-        if (!oauthEnabled && process.env.MCP_API_KEY) {
-          // Accept both X-API-Key (Copilot Studio) and Authorization: Bearer (Cowork/Teams ApiKeyPluginVault vault injection)
+        // Path 1: Legacy Claude.ai / Claude Code full OAuth proxy (MCP_OAUTH_ENABLED=true)
+        if (oauthEnabled && entraConfig) {
+          const authHeader = req.headers.authorization;
+
+          if (!authHeader?.startsWith("Bearer ")) {
+            res.writeHead(401, {
+              "Content-Type": "application/json",
+              "WWW-Authenticate": `Bearer resource_metadata="${entraConfig.serverUrl}/.well-known/oauth-protected-resource"`,
+            });
+            res.end(JSON.stringify({ error: "unauthorized", message: "Bearer token required" }));
+            return;
+          }
+
+          const token = authHeader.slice(7);
+
+          try {
+            let identity;
+            const staticTokenMatch =
+              entraConfig.bearerToken !== undefined &&
+              timingSafeEqual(
+                createHash("sha256").update(token).digest(),
+                createHash("sha256").update(entraConfig.bearerToken).digest(),
+              );
+            if (staticTokenMatch) {
+              identity = { upn: "cli-user", roles: [entraConfig.requiredRole], oid: "static" };
+            } else {
+              identity = await validateToken(token, entraConfig, oauthJwks!);
+            }
+            console.error(`[audit] ${identity.upn} | ${new Date().toISOString()} | POST /mcp`);
+          } catch (err) {
+            if (err instanceof AuthError) {
+              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
+            } else {
+              console.error("[auth] Unexpected validation error:", err);
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "internal_error" }));
+            }
+            return;
+          }
+        }
+
+        // Path 2: Cowork / Teams vault-injection Entra SSO (AUTH_MODE=entra)
+        else if (mcpAuthMode === "entra") {
+          const authHeader = req.headers.authorization;
+
+          if (!authHeader?.startsWith("Bearer ")) {
+            res.writeHead(401, {
+              "Content-Type": "application/json",
+              "WWW-Authenticate": "Bearer",
+            });
+            res.end(JSON.stringify({ error: "unauthorized", message: "Entra Bearer token required" }));
+            return;
+          }
+
+          const token = authHeader.slice(7);
+
+          try {
+            await validateCoworkToken(token, coworkEntraConfig!, coworkJwks!);
+          } catch (err) {
+            if (err instanceof AuthError) {
+              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
+            } else {
+              console.error("[auth] Unexpected Entra validation error:", err);
+              res.writeHead(500, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ error: "internal_error" }));
+            }
+            return;
+          }
+        }
+
+        // Path 3: Static API key (AUTH_MODE=apikey — default)
+        else if (mcpAuthMode === "apikey" && process.env.MCP_API_KEY) {
+          // Accept X-API-Key (Copilot Studio) or Authorization: Bearer (legacy vault path)
           const xApiKey = req.headers["x-api-key"] as string | undefined;
           const authHeader = req.headers["authorization"] as string | undefined;
           const bearerKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
@@ -202,64 +329,12 @@ async function startHttpTransport(): Promise<void> {
             );
           if (!valid) {
             res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "unauthorized", message: "Valid X-API-Key or Authorization: Bearer header required" }));
+            res.end(JSON.stringify({ error: "unauthorized", message: "Valid X-API-Key header required" }));
             return;
           }
         }
 
-        if (oauthEnabled && entraConfig) {
-          const authHeader = req.headers.authorization;
-
-          if (!authHeader?.startsWith("Bearer ")) {
-            res.writeHead(401, {
-              "Content-Type": "application/json",
-              "WWW-Authenticate": `Bearer resource_metadata="${entraConfig.serverUrl}/.well-known/oauth-protected-resource"`,
-            });
-            res.end(
-              JSON.stringify({
-                error: "unauthorized",
-                message: "Bearer token required",
-              }),
-            );
-            return;
-          }
-
-          const token = authHeader.slice(7);
-
-          try {
-            let identity;
-            // Static bearer token check (Claude Code CLI / Claude Desktop)
-            // Use timing-safe comparison to prevent token length oracle attacks
-            const staticTokenMatch =
-              entraConfig.bearerToken !== undefined &&
-              timingSafeEqual(
-                createHash("sha256").update(token).digest(),
-                createHash("sha256").update(entraConfig.bearerToken).digest(),
-              );
-            if (staticTokenMatch) {
-              identity = {
-                upn: "cli-user",
-                roles: [entraConfig.requiredRole],
-                oid: "static",
-              };
-            } else {
-              identity = await validateToken(token, entraConfig, jwksClient!);
-            }
-            console.error(
-              `[audit] ${identity.upn} | ${new Date().toISOString()} | POST /mcp`,
-            );
-          } catch (err) {
-            if (err instanceof AuthError) {
-              res.writeHead(err.statusCode, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "auth_failed", message: err.message }));
-            } else {
-              console.error("[auth] Unexpected validation error:", err);
-              res.writeHead(500, { "Content-Type": "application/json" });
-              res.end(JSON.stringify({ error: "internal_error" }));
-            }
-            return;
-          }
-        }
+        // Path 4: AUTH_MODE=none — no auth (dev only; startup already logged a warning)
 
         // ------------------------------------------------------------------
         // Gateway mode: extract CW credentials from headers (per request,
@@ -338,9 +413,7 @@ async function startHttpTransport(): Promise<void> {
         `ConnectWise Manage MCP server listening on http://${host}:${port}/mcp`,
       );
       console.error(`Health check available at http://${host}:${port}/health`);
-      console.error(
-        `Authentication mode: ${isGatewayMode ? "gateway (header-based)" : "env (environment variables)"}`,
-      );
+      console.error(`mode: ${mcpAuthMode === "none" ? "none (UNPROTECTED)" : mcpAuthMode}`);
       resolve();
     });
   });

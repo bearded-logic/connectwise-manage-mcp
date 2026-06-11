@@ -1,7 +1,7 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createHash, timingSafeEqual } from "node:crypto";
-import { AuthError, type EntraConfig } from "./types.js";
-import { validateToken } from "./middleware.js";
+import { AuthError, type EntraConfig, type CoworkEntraConfig } from "./types.js";
+import { validateToken, validateCoworkToken, getCoworkEntraConfig } from "./middleware.js";
 
 // ---------------------------------------------------------------------------
 // Mock jose so tests don't hit real Azure AD
@@ -30,10 +30,30 @@ const config: EntraConfig = {
   serverUrl: "https://mcp.example.com",
 };
 
+const coworkConfig: CoworkEntraConfig = {
+  tenantId: "test-tenant-id",
+  audiences: ["api://test-audience", "test-client-id"],
+  allowedClientIds: ["ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b", "allowed-client-id"],
+};
+
 const mockJwks = vi.fn() as unknown as ReturnType<typeof import("jose").createRemoteJWKSet>;
 
+function makePayload(overrides: Record<string, unknown> = {}) {
+  return {
+    tid: "test-tenant-id",
+    aud: "api://test-audience",
+    iss: "https://login.microsoftonline.com/test-tenant-id/v2.0",
+    azp: "ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b",
+    sub: "vault-client",
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 3600,
+    nbf: Math.floor(Date.now() / 1000),
+    ...overrides,
+  };
+}
+
 // ---------------------------------------------------------------------------
-// validateToken
+// validateToken (legacy Claude.ai / Claude Code path)
 // ---------------------------------------------------------------------------
 
 describe("validateToken", () => {
@@ -125,7 +145,6 @@ describe("validateToken", () => {
   });
 
   it("propagates AuthError immediately without retrying other audiences", async () => {
-    const authErr = new AuthError("Access denied: missing required role 'CWM.Access'", 403);
     vi.mocked(jwtVerify).mockResolvedValueOnce({
       payload: {
         tid: "test-tenant-id",
@@ -144,8 +163,167 @@ describe("validateToken", () => {
 
     const error = await validateToken("bad-role-token", config, mockJwks).catch((e) => e);
     expect(error).toBeInstanceOf(AuthError);
-    // jwtVerify should only be called once — AuthError is not retried
     expect(vi.mocked(jwtVerify)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// validateCoworkToken (AUTH_MODE=entra — Cowork vault-injection path)
+// ---------------------------------------------------------------------------
+
+describe("validateCoworkToken", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("accepts a valid token with allowed azp and matching audience", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ upn: "cowork@example.com" }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    const identity = await validateCoworkToken("good-token", coworkConfig, mockJwks);
+    expect(identity.azp).toBe("ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b");
+    expect(identity.upn).toBe("cowork@example.com");
+  });
+
+  it("accepts a v1 token using appid claim instead of azp", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ azp: undefined, appid: "ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b" }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    const identity = await validateCoworkToken("v1-token", coworkConfig, mockJwks);
+    expect(identity.azp).toBe("ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b");
+  });
+
+  it("throws AuthError(401) when azp is not in allowedClientIds", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ azp: "some-unknown-client" }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    const error = await validateCoworkToken("bad-client-token", coworkConfig, mockJwks).catch((e) => e);
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).statusCode).toBe(401);
+    expect(error.message).toContain("Unauthorised client application");
+  });
+
+  it("throws AuthError(401) when azp and appid are both absent", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ azp: undefined }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    const error = await validateCoworkToken("no-azp-token", coworkConfig, mockJwks).catch((e) => e);
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).statusCode).toBe(401);
+  });
+
+  it("throws AuthError(401) when tenant id does not match", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ tid: "wrong-tenant" }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    const error = await validateCoworkToken("bad-tenant-token", coworkConfig, mockJwks).catch((e) => e);
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).statusCode).toBe(401);
+    expect(error.message).toContain("tenant");
+  });
+
+  it("throws AuthError(401) when jwtVerify rejects all audiences (expired/invalid/wrong audience)", async () => {
+    vi.mocked(jwtVerify).mockRejectedValue(new Error("JWTExpired"));
+
+    const error = await validateCoworkToken("expired-token", coworkConfig, mockJwks).catch((e) => e);
+    expect(error).toBeInstanceOf(AuthError);
+    expect((error as AuthError).statusCode).toBe(401);
+    expect(error.message).toContain("JWTExpired");
+  });
+
+  it("propagates AuthError immediately without retrying remaining audiences", async () => {
+    vi.mocked(jwtVerify).mockResolvedValueOnce({
+      payload: makePayload({ azp: "some-unknown-client" }),
+      protectedHeader: { alg: "RS256" },
+      key: {} as any,
+    } as any);
+
+    await validateCoworkToken("bad-client-token", coworkConfig, mockJwks).catch(() => {});
+    // Only the first audience should be tried before the AuthError short-circuits
+    expect(vi.mocked(jwtVerify)).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// getCoworkEntraConfig — startup validation
+// ---------------------------------------------------------------------------
+
+describe("getCoworkEntraConfig", () => {
+  const origEnv = process.env;
+
+  beforeEach(() => {
+    process.env = { ...origEnv };
+    delete process.env.ENTRA_TENANT_ID;
+    delete process.env.ENTRA_AUDIENCE;
+    delete process.env.AZURE_TENANT_ID;
+    delete process.env.AZURE_AUDIENCE;
+    delete process.env.ENTRA_ALLOWED_CLIENT_IDS;
+  });
+
+  afterEach(() => {
+    process.env = origEnv;
+  });
+
+  it("returns config when ENTRA_* vars are set", () => {
+    process.env.ENTRA_TENANT_ID = "my-tenant";
+    process.env.ENTRA_AUDIENCE = "api://my-app";
+
+    const cfg = getCoworkEntraConfig();
+    expect(cfg.tenantId).toBe("my-tenant");
+    expect(cfg.audiences).toEqual(["api://my-app"]);
+    expect(cfg.allowedClientIds).toContain("ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b");
+  });
+
+  it("falls back to AZURE_* vars when ENTRA_* are absent", () => {
+    process.env.AZURE_TENANT_ID = "azure-tenant";
+    process.env.AZURE_AUDIENCE = "api://azure-app";
+
+    const cfg = getCoworkEntraConfig();
+    expect(cfg.tenantId).toBe("azure-tenant");
+  });
+
+  it("supports comma-separated audiences", () => {
+    process.env.ENTRA_TENANT_ID = "my-tenant";
+    process.env.ENTRA_AUDIENCE = "api://app-one, api://app-two";
+
+    const cfg = getCoworkEntraConfig();
+    expect(cfg.audiences).toEqual(["api://app-one", "api://app-two"]);
+  });
+
+  it("supports comma-separated ENTRA_ALLOWED_CLIENT_IDS", () => {
+    process.env.ENTRA_TENANT_ID = "my-tenant";
+    process.env.ENTRA_AUDIENCE = "api://my-app";
+    process.env.ENTRA_ALLOWED_CLIENT_IDS = "client-a, client-b";
+
+    const cfg = getCoworkEntraConfig();
+    expect(cfg.allowedClientIds).toEqual(["client-a", "client-b"]);
+  });
+
+  it("throws when ENTRA_TENANT_ID is missing", () => {
+    process.env.ENTRA_AUDIENCE = "api://my-app";
+
+    expect(() => getCoworkEntraConfig()).toThrow(/ENTRA_TENANT_ID/);
+  });
+
+  it("throws when ENTRA_AUDIENCE is missing", () => {
+    process.env.ENTRA_TENANT_ID = "my-tenant";
+
+    expect(() => getCoworkEntraConfig()).toThrow(/ENTRA_AUDIENCE/);
   });
 });
 
@@ -171,13 +349,11 @@ describe("static bearer token comparison", () => {
 
   it("returns false for same-length wrong token (no length oracle)", () => {
     const stored = "abcdefghij";
-    const wrong = "xxxxxxxxxx"; // same length, different content
+    const wrong = "xxxxxxxxxx";
     expect(compareTokens(wrong, stored)).toBe(false);
   });
 
   it("returns false for shorter token without throwing", () => {
-    // SHA-256 hashes are always 32 bytes regardless of input length,
-    // so timingSafeEqual never throws a length mismatch error
     expect(compareTokens("short", "much-longer-secret-token")).toBe(false);
   });
 
