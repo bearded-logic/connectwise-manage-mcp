@@ -188,7 +188,11 @@ async function startHttpTransport(): Promise<void> {
         // Copilot Studio: Tools → Add tool → MCP → Auth: API key → Header name: X-API-Key
         // For production TechConnect, upgrade to full Entra ID OAuth (MCP_OAUTH_ENABLED=true).
         if (!oauthEnabled && process.env.MCP_API_KEY) {
-          const provided = req.headers["x-api-key"] as string | undefined;
+          // Accept both X-API-Key (Copilot Studio) and Authorization: Bearer (Cowork/Teams ApiKeyPluginVault vault injection)
+          const xApiKey = req.headers["x-api-key"] as string | undefined;
+          const authHeader = req.headers["authorization"] as string | undefined;
+          const bearerKey = authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+          const provided = xApiKey ?? bearerKey;
           const expected = process.env.MCP_API_KEY;
           const valid =
             provided !== undefined &&
@@ -198,7 +202,7 @@ async function startHttpTransport(): Promise<void> {
             );
           if (!valid) {
             res.writeHead(401, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "unauthorized", message: "Valid X-API-Key header required" }));
+            res.end(JSON.stringify({ error: "unauthorized", message: "Valid X-API-Key or Authorization: Bearer header required" }));
             return;
           }
         }
