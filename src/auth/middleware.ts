@@ -1,8 +1,29 @@
 import { createRemoteJWKSet, jwtVerify, type JWTPayload, type RemoteJWKSetOptions } from "jose";
-import { AuthError, type EntraConfig, type EntraIdentity } from "./types.js";
+import {
+  AuthError,
+  type CoworkEntraConfig,
+  type CoworkIdentity,
+  type EntraConfig,
+  type EntraIdentity,
+} from "./types.js";
 
 // ---------------------------------------------------------------------------
-// Config
+// Shared JWKS helpers
+// ---------------------------------------------------------------------------
+
+type JwksClient = ReturnType<typeof createRemoteJWKSet>;
+
+export function createJwksClient(tenantId: string): JwksClient {
+  const jwksUrl = new URL(
+    `https://login.microsoftonline.com/${tenantId}/discovery/v2.0/keys`,
+  );
+  const options: RemoteJWKSetOptions = { cacheMaxAge: 60 * 60 * 1000 };
+  return createRemoteJWKSet(jwksUrl, options);
+}
+
+// ---------------------------------------------------------------------------
+// Legacy Claude.ai / Claude Code OAuth path
+// (active when MCP_OAUTH_ENABLED=true; full proxy flow with role check)
 // ---------------------------------------------------------------------------
 
 export function getEntraConfig(): EntraConfig {
@@ -27,26 +48,6 @@ export function getEntraConfig(): EntraConfig {
   };
 }
 
-// ---------------------------------------------------------------------------
-// JWKS client (cached per-process by jose)
-// ---------------------------------------------------------------------------
-
-type JwksClient = ReturnType<typeof createRemoteJWKSet>;
-
-export function createJwksClient(config: EntraConfig): JwksClient {
-  const jwksUrl = new URL(
-    `https://login.microsoftonline.com/${config.tenantId}/discovery/v2.0/keys`,
-  );
-  const options: RemoteJWKSetOptions = {
-    cacheMaxAge: 60 * 60 * 1000, // 1 hour
-  };
-  return createRemoteJWKSet(jwksUrl, options);
-}
-
-// ---------------------------------------------------------------------------
-// Token validation
-// ---------------------------------------------------------------------------
-
 interface EntraJwtPayload extends JWTPayload {
   upn?: string;
   unique_name?: string;
@@ -62,13 +63,11 @@ export async function validateToken(
   config: EntraConfig,
   jwks: JwksClient,
 ): Promise<EntraIdentity> {
-  // Try multiple audiences — Azure AD may issue tokens with api://clientId or
-  // just clientId depending on app registration configuration.
   const audiencesToTry = [
     config.audience,
     config.clientId,
     `api://${config.clientId}`,
-  ].filter((a, i, arr) => arr.indexOf(a) === i); // deduplicate
+  ].filter((a, i, arr) => arr.indexOf(a) === i);
 
   let lastError: unknown;
 
@@ -79,12 +78,10 @@ export async function validateToken(
         audience: aud,
       });
 
-      // Validate tenant
       if (payload.tid && payload.tid !== config.tenantId) {
         throw new AuthError("Token tenant does not match expected tenant", 401);
       }
 
-      // Validate app role
       const roles: string[] = payload.roles ?? [];
       if (!roles.includes(config.requiredRole)) {
         console.error(
@@ -115,7 +112,6 @@ export async function validateToken(
     }
   }
 
-  // All audiences failed — log the token's actual aud claim for diagnostics
   try {
     const parts = token.split(".");
     if (parts.length === 3) {
@@ -128,6 +124,111 @@ export async function validateToken(
     }
   } catch {
     // ignore decode errors
+  }
+
+  throw new AuthError(
+    `Invalid token: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+    401,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Cowork / Teams vault-injection Entra path
+// (active when AUTH_MODE=entra; validates azp, no role check)
+// ---------------------------------------------------------------------------
+
+export function getCoworkEntraConfig(): CoworkEntraConfig {
+  // Accept both ENTRA_* (new) and AZURE_* (legacy fallbacks)
+  const tenantId = process.env.ENTRA_TENANT_ID ?? process.env.AZURE_TENANT_ID;
+  const audienceRaw = process.env.ENTRA_AUDIENCE ?? process.env.AZURE_AUDIENCE;
+
+  if (!tenantId || !audienceRaw) {
+    throw new Error(
+      "AUTH_MODE=entra requires ENTRA_TENANT_ID (or AZURE_TENANT_ID) and ENTRA_AUDIENCE (or AZURE_AUDIENCE)",
+    );
+  }
+
+  const audiences = audienceRaw
+    .split(",")
+    .map((a) => a.trim())
+    .filter(Boolean);
+
+  // Default includes the Microsoft Enterprise Token Store client that Cowork uses to inject credentials.
+  const allowedClientIds = (
+    process.env.ENTRA_ALLOWED_CLIENT_IDS ?? "ab3be6b7-f5df-413d-ac2d-abf1e3fd9c0b"
+  )
+    .split(",")
+    .map((id) => id.trim())
+    .filter(Boolean);
+
+  return { tenantId, audiences, allowedClientIds };
+}
+
+interface CoworkJwtPayload extends JWTPayload {
+  azp?: string; // authorised party — OAuth 2.0 client that requested the token (v2)
+  appid?: string; // same concept, v1 claim name
+  tid?: string;
+  upn?: string;
+  preferred_username?: string;
+}
+
+export async function validateCoworkToken(
+  token: string,
+  config: CoworkEntraConfig,
+  jwks: JwksClient,
+): Promise<CoworkIdentity> {
+  let lastError: unknown;
+
+  for (const audience of config.audiences) {
+    try {
+      const { payload } = await jwtVerify<CoworkJwtPayload>(token, jwks, {
+        // Accept both v2 and v1 issuers defensively
+        issuer: [
+          `https://login.microsoftonline.com/${config.tenantId}/v2.0`,
+          `https://sts.windows.net/${config.tenantId}/`,
+        ],
+        audience,
+        clockTolerance: 60, // 60 s skew tolerance
+      });
+
+      // Tenant check
+      if (payload.tid && payload.tid !== config.tenantId) {
+        throw new AuthError("Token tenant does not match expected tenant", 401);
+      }
+
+      // azp / appid allowlist — this is the authorisation gate
+      const clientId = payload.azp ?? payload.appid;
+      if (!clientId || !config.allowedClientIds.includes(clientId)) {
+        console.error(
+          `[auth] Cowork azp check failed — token azp/appid: ${clientId ?? "(none)"}, allowed: [${config.allowedClientIds.join(", ")}]`,
+        );
+        throw new AuthError(`Unauthorised client application: ${clientId ?? "(none)"}`, 401);
+      }
+
+      const upn = payload.upn ?? payload.preferred_username ?? payload.sub ?? "vault-client";
+
+      console.error(`[audit] Cowork call accepted — upn=${upn} azp=${clientId} aud=${audience}`);
+
+      return { upn, azp: clientId };
+    } catch (err) {
+      if (err instanceof AuthError) throw err;
+      lastError = err;
+    }
+  }
+
+  // Log diagnostic info without exposing token
+  try {
+    const parts = token.split(".");
+    if (parts.length === 3) {
+      const decoded = JSON.parse(
+        Buffer.from(parts[1]!, "base64url").toString("utf8"),
+      ) as CoworkJwtPayload;
+      console.error(
+        `[auth] Cowork JWT validation failed. aud=${JSON.stringify(decoded.aud)} azp=${decoded.azp ?? decoded.appid ?? "(none)"} triedAudiences=${JSON.stringify(config.audiences)}`,
+      );
+    }
+  } catch {
+    // ignore
   }
 
   throw new AuthError(
